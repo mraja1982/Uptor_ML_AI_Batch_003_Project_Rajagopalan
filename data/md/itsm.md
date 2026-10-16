@@ -1,0 +1,5 @@
+This document provides a highly structured IT Service Management (ITSM) Process Framework Reference Guide organized around ITIL practices.
+• Core ITSM Process Lifecycles: Detailed structural flows for Incident Management, Problem Management, Change Enablement, and Service Asset & Configuration Management (SACM).
+• Operational Workflows: Step-by-step lifecycles covering detection, logging, root cause analysis (RCA), and Change Advisory Board (CAB) classifications.
+• Process Matrix Table: A quick-reference direct comparison matrix cross-linking focus areas, target audiences, and specific operational Key Performance Indicators (KPIs) like Mean Time to Restore (MTTR) and change success rates.
+• Continuous Service Improvement (CSI): Framework guidelines on auditing metrics against Service Level Agreements (SLAs) for structural optimizations.

@@ -1,0 +1,15 @@
+Run below command to start the api
+----------------------------------
+uvicorn api:app --host 0.0.0.0 --port 8000
+
+Run below command to start ui
+-----------------------------
+streamlit run ui.py
+
+Example Incident to test
+------------------------
+101483
+
+Example Server/Ci to test
+-------------------------
+srv-web-prod-01

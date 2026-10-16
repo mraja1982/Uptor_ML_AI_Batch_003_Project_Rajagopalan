@@ -1,0 +1,14 @@
+{
+  "101483": {
+    "incident_id": "101483",
+    "ci_name": "srv-web-prod-01",
+    "decision": "Approved",
+    "corrected_root_cause": "",
+    "corrective_action": "",
+    "preventive_action": "",
+    "comments": "",
+    "reviewer": "Human reviewer",
+    "recorded_at": "2026-10-17T00:39:22",
+    "production_action_executed": false
+  }
+}

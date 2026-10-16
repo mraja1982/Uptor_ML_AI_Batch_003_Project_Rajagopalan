@@ -1,0 +1,10 @@
+streamlit>=1.45
+pandas>=2.2
+openpyxl>=3.1
+altair>=5.4
+chromadb>=1.0
+pypdf>=5.0
+fastapi>=0.115
+uvicorn[standard]>=0.34
+requests>=2.32
+pydantic>=2.10
