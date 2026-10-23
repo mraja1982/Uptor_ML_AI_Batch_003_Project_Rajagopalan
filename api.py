@@ -19,7 +19,9 @@ AGENT2_PREDICT=int(os.getenv("AGENT2_NUM_PREDICT","45"))
 AGENT3_PREDICT=int(os.getenv("AGENT3_NUM_PREDICT","45"))
 CHROMA_DIR=Path(os.getenv("CHROMA_DIR",str(config.DATA_DIR/"chroma")))
 FEEDBACK_FILE=Path(config.DATA_DIR)/"incident_feedback.json"
+APPROVAL_FILE=Path(config.DATA_DIR)/"agent_approvals.json"
 FEEDBACK_LOCK=threading.Lock()
+APPROVAL_LOCK=threading.Lock()
 SERVER_LIMIT=10
 DF: pd.DataFrame|None=None
 COLLECTION=None
@@ -34,6 +36,14 @@ class FeedbackRequest(BaseModel):
     preventive_action:str=""
     comments:str=""
     reviewer:str="Human reviewer"
+
+class ApprovalRequest(BaseModel):
+    ci_name:str
+    incident_id:str=""
+    decision:str
+    approved_action:str=""
+    reviewer:str="Human reviewer"
+    comments:str=""
 
 @asynccontextmanager
 async def lifespan(app:FastAPI):
@@ -103,6 +113,49 @@ def feedback_save(x):
     FEEDBACK_FILE.parent.mkdir(parents=True,exist_ok=True); tmp=FEEDBACK_FILE.with_suffix(".tmp")
     with FEEDBACK_LOCK:
         tmp.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(FEEDBACK_FILE)
+
+
+
+def approval_load():
+    if not APPROVAL_FILE.exists(): return {}
+    try:
+        with APPROVAL_LOCK: return json.loads(APPROVAL_FILE.read_text(encoding="utf-8"))
+    except Exception: return {}
+
+def approval_save(x):
+    APPROVAL_FILE.parent.mkdir(parents=True,exist_ok=True); tmp=APPROVAL_FILE.with_suffix(".tmp")
+    with APPROVAL_LOCK:
+        tmp.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding="utf-8"); tmp.replace(APPROVAL_FILE)
+
+def ci_forecast_risk(history):
+    if history.empty or "opened_at" not in history.columns:
+        return {"risk_score":0,"risk_level":"Low","monthly_history":[],"forecast":[],"forecast_method":"Insufficient dated incident history."}
+    w=history.copy(); w["_date"]=pd.to_datetime(w["opened_at"],errors="coerce"); w=w.dropna(subset=["_date"])
+    if w.empty: return {"risk_score":0,"risk_level":"Low","monthly_history":[],"forecast":[],"forecast_method":"Insufficient dated incident history."}
+    m=w.set_index("_date").resample("MS").size().rename("count").reset_index(); recent_m=m.tail(6)
+    counts=recent_m["count"].astype(float).tolist(); slope=0.0
+    if len(counts)>=2:
+        import numpy as np
+        slope=float(np.polyfit(np.arange(len(counts),dtype=float),np.array(counts),1)[0])
+    avg=float(m["count"].mean()); recent90=int((w["_date"]>=w["_date"].max()-pd.Timedelta(days=90)).sum())
+    highcrit=0
+    if "priority" in w.columns:
+        highcrit=int(w["priority"].fillna("").astype(str).str.lower().isin(["high","critical"]).sum())
+    priority_score=min(25.0,25.0*highcrit/max(len(w),1))
+    recurrence_score=0.0; top_pattern=None
+    if "description" in w.columns:
+        d=w["description"].fillna("").astype(str).str.strip(); d=d[d.ne("")]
+        if len(d):
+            vc=d.value_counts(); top_count=int(vc.iloc[0]); top_pattern={"description":str(vc.index[0]),"count":top_count,"share_pct":round(top_count/len(d)*100,1)}; recurrence_score=min(20.0,20.0*top_count/max(len(w),1))
+    volume_score=min(30.0,avg*3.0); trend_score=min(25.0,max(0.0,slope)*8.0)
+    score=int(round(min(100.0,volume_score+trend_score+priority_score+recurrence_score)))
+    level="Critical" if score>=80 else "High" if score>=60 else "Medium" if score>=35 else "Low"
+    forecast=[]
+    for step in range(1,4):
+        month=(m.iloc[-1]["_date"]+pd.DateOffset(months=step)).strftime("%Y-%m")
+        predicted=max(0,int(round(counts[-1]+slope*step))) if counts else 0
+        forecast.append({"month":month,"forecast_incidents":predicted})
+    return {"risk_score":score,"risk_level":level,"risk_components":{"volume_score":round(volume_score,1),"trend_score":round(trend_score,1),"priority_score":round(priority_score,1),"recurrence_score":round(recurrence_score,1)},"average_monthly_incidents":round(avg,1),"recent_90_day_incidents":recent90,"trend_per_month":round(slope,2),"top_recurring_pattern":top_pattern,"monthly_history":[{"month":r["_date"].strftime("%Y-%m"),"incident_count":int(r["count"])} for _,r in recent_m.iterrows()],"forecast":forecast,"forecast_method":"Deterministic linear trend over the latest six observed calendar months; LLM is not used for the score or forecast."}
 
 def knowledge_for(row,limit=1):
     if COLLECTION is None:return []
@@ -205,7 +258,32 @@ def proactive(req:ProactiveRequest):
     except HTTPException as exc: llm="AI recommendation unavailable; deterministic risk evidence is still valid."; elapsed=None; status="timeout" if exc.status_code==504 else "unavailable"
     risk=ev["recurring_descriptions"][0] if ev["recurring_descriptions"] else None
     grounded={"key_risk":f"Recurring incident pattern: {risk['description']} ({risk['count']} occurrences)." if risk else "No single recurring description is sufficiently dominant.","evidence_basis":ev,"technical_cause_proven":False}
-    return {"ci_name":ci,"incident_count":len(history),"recent_incidents":clean_records(history,10),"knowledge_sources":knowledge,"human_feedback_count":len(fbs),"answer":llm,"grounded_assessment":grounded,"model":OLLAMA_MODEL,"timing":{"ollama_seconds":round(elapsed,3) if elapsed is not None else None},"ai_status":status,"production_action_executed":False,"requires_human_approval":True}
+    return {"ci_name":ci,"incident_count":len(history),"recent_incidents":clean_records(history,10),"knowledge_sources":knowledge,"human_feedback_count":len(fbs),"answer":llm,"grounded_assessment":grounded,"model":OLLAMA_MODEL,"timing":{"ollama_seconds":round(elapsed,3) if elapsed is not None else None},"ai_status":status,"production_action_executed":False,"requires_human_approval":True,"forecast_risk":ci_forecast_risk(history)}
+
+@app.get("/api/ci-risk-forecast")
+def ci_risk_forecast(ci_name:str=""):
+    ci=ci_name.strip()
+    if not ci: raise HTTPException(400,"ci_name is required")
+    history=ci_filter(data(),ci)
+    if history.empty: raise HTTPException(404,f"No incidents found for CI: {ci}")
+    return {"ci_name":ci,"incident_count":len(history),**ci_forecast_risk(history)}
+
+@app.get("/api/agents/approvals")
+def approval_history(ci_name:str=""):
+    items=list(approval_load().values())
+    if ci_name.strip(): items=[x for x in items if norm(x.get("ci_name"))==norm(ci_name)]
+    return {"items":items}
+
+@app.post("/api/agents/approval")
+def save_approval(req:ApprovalRequest):
+    ci=req.ci_name.strip(); decision=req.decision.strip().lower()
+    if not ci: raise HTTPException(400,"ci_name is required")
+    if decision not in {"approved","rejected","needs review"}: raise HTTPException(400,"decision must be Approved, Rejected, or Needs Review")
+    if ci_filter(data(),ci).empty: raise HTTPException(404,f"No incidents found for CI: {ci}")
+    approval_id=f"{ci}|{req.incident_id.strip()}|{int(time.time()*1000)}"
+    record={"approval_id":approval_id,"ci_name":ci,"incident_id":req.incident_id.strip(),"decision":decision.title(),"approved_action":req.approved_action.strip(),"reviewer":req.reviewer.strip() or "Human reviewer","comments":req.comments.strip(),"recorded_at":time.strftime("%Y-%m-%dT%H:%M:%S"),"production_action_executed":False,"governance_status":"Approved for implementation" if decision=="approved" else ("Rejected" if decision=="rejected" else "Needs Review")}
+    d=approval_load(); d[approval_id]=record; approval_save(d)
+    return {"status":"saved","message":"Human approval decision recorded. No production change was executed.","approval":record,"production_action_executed":False}
 
 @app.get("/api/agents/feedback")
 def feedback_history(incident_id:str=""):

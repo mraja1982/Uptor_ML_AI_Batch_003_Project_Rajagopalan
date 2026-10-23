@@ -50,3 +50,4 @@ logs/
 # Local model/cache files
 models/
 ollama/
+backup/

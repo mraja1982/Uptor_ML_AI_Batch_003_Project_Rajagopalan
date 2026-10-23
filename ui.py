@@ -1,762 +1,756 @@
-"""Incident Copilot Streamlit UI. Deterministic analytics + grounded Agent 2/3 workflow."""
+"""Local Incident Knowledge Copilot. Streamlit UI backed by FastAPI; LLM is used only for proactive analysis."""
 from __future__ import annotations
 import datetime as dt
-import pandas as pd, requests, streamlit as st
-import analytics, config, dashboard
+import pandas as pd
+import streamlit as st
+import requests
+import analytics
+import config
+import dashboard
+import chat_engine
+st.set_page_config(page_title='Incident Knowledge Copilot', page_icon='🤖', layout='wide')
 
-st.set_page_config(page_title="Incident Knowledge Copilot",page_icon="🤖",layout="wide")
-API_BASE=getattr(config,"API_BASE_URL","http://127.0.0.1:8000")
+# Persist AI results across Streamlit reruns.
+st.session_state.setdefault('proactive_result', None)
+st.session_state.setdefault('proactive_ci', '')
+st.session_state.setdefault('forecast_result', None)
+st.session_state.setdefault('forecast_ci', '')
+st.session_state.setdefault('approval_result', None)
 
-def get(path,params=None,timeout=30):
- r=requests.get(API_BASE+path,params=params,timeout=timeout); r.raise_for_status(); return r.json()
-def post(path,payload,timeout=90):
- r=requests.post(API_BASE+path,json=payload,timeout=timeout); r.raise_for_status(); return r.json()
-def safe_df(x):
- out=x.copy()
- for c in out.columns:
-  if pd.api.types.is_datetime64_any_dtype(out[c]): out[c]=out[c].dt.strftime("%Y-%m-%d %H:%M:%S")
-  elif out[c].dtype=="object": out[c]=out[c].map(lambda v:v.isoformat() if isinstance(v,pd.Timestamp) else v)
- return out
-
-def sort_recent(x):
- y=x.copy()
- if "opened_at" in y.columns:
-  y["_d"]=pd.to_datetime(y.opened_at,errors="coerce"); y=y.sort_values("_d",ascending=False,na_position="last").drop(columns="_d")
- return y
-
-def incident_label(r): return f"{r.get('incident_id','')} | {r.get('ci_name','')} | {r.get('opened_at','')} | {r.get('description','')}"
-
-def expander(r,prefix):
-    with st.expander(incident_label(r), key=f"{prefix}_{r.get('incident_id','')}"):
-        data = r.drop(labels=["search_text"], errors="ignore").to_frame("value")
-        st.dataframe(safe_df(data), width="stretch")
+def forecast_api_url() -> str:
+    return getattr(config, "API_CI_RISK_FORECAST_URL", "http://127.0.0.1:8000/api/ci-risk-forecast")
 
 
-def _fmt(v, default="-"):
-    return default if v is None or v == "" else str(v)
+def approval_api_url() -> str:
+    return getattr(config, "API_APPROVAL_URL", "http://127.0.0.1:8000/api/agents/approval")
 
 
-def _safe_list(v):
-    return v if isinstance(v, list) else []
-
-
-def _pattern_table(patterns, label="Pattern"):
-    rows = []
-    for x in _safe_list(patterns):
-        if isinstance(x, dict):
-            rows.append({label: x.get("name", "-"), "Occurrences": x.get("count", 0)})
-    return pd.DataFrame(rows)
-
-
-def _incident_table(items):
-    rows = []
-    for x in _safe_list(items):
-        if isinstance(x, dict):
-            rows.append({
-                "Incident": x.get("incident_id", "-"), "CI": x.get("ci_name", "-"),
-                "Priority": x.get("priority", "-"), "Closure": x.get("closure_code", "-"),
-                "Description": x.get("description", "-"), "Resolution": x.get("resolution", "-"),
-                "Opened": x.get("opened_at", "-"),
-            })
-    return pd.DataFrame(rows)
-
-
-def render_rca(r):
-    inc = r.get("incident", {})
-    g = r.get("grounded_assessment", {})
-    e = r.get("evidence", {})
-    st.markdown("## 🛡️ Grounded RCA Summary")
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Incident", _fmt(inc.get("incident_id"))); c2.metric("CI", _fmt(inc.get("ci_name")))
-    c3.metric("Priority", _fmt(inc.get("priority"))); c4.metric("Closure", _fmt(inc.get("closure_code")))
-    st.markdown("### Executive Assessment")
-    root=g.get("root_cause") or "Root cause unconfirmed; additional technical validation is required."
-    (st.success if g.get("technical_cause_proven") else st.warning)(root)
-    c1,c2,c3=st.columns(3)
-    c1.metric("Confidence", _fmt(g.get("confidence"),"Low"))
-    c2.metric("Technical cause proven", "Yes" if g.get("technical_cause_proven") else "No")
-    c3.metric("Evidence status", _fmt(e.get("root_cause_support_level","inconclusive").title()))
-    st.markdown("### Incident Facts")
-    st.dataframe(pd.DataFrame([{
-        "Description":inc.get("description","-"),"Resolution":inc.get("resolution","-"),
-        "Opened":inc.get("opened_at","-"),"Historical CI incidents":e.get("historical_incident_count",0),
-        "Same-description incidents":e.get("same_description_count_in_ci",0),
-    }]), width="stretch", hide_index=True)
-    st.markdown("### Historical Evidence")
-    a,b=st.columns(2)
-    with a:
-        st.caption("Closure patterns for exact description")
-
-        t = _pattern_table(
-            e.get("same_description_closure_patterns")
-        )
-
-        if not t.empty:
-            st.dataframe(
-                t,
-                width="stretch",
-                hide_index=True
-            )
-        else:
-            st.info("No closure pattern available.")
-
-    with b:
-        st.caption("Resolution patterns for exact description")
-
-        t = _pattern_table(
-            e.get("same_description_resolution_patterns"),
-            "Resolution"
-        )
-
-        if not t.empty:
-            st.dataframe(
-                t,
-                width="stretch",
-                hide_index=True
-            )
-        else:
-            st.info("No resolution pattern available.")
-    sims=e.get("same_description_incidents") or []
-    if sims:
-        st.markdown("### Comparable Historical Incidents")
-        st.dataframe(_incident_table(sims),width="stretch",hide_index=True)
-    st.markdown("### AI Interpretation — Advisory")
-    st.markdown(r.get("ai_interpretation") or r.get("answer") or "No additional AI interpretation was returned.")
-    with st.expander("🔍 Technical evidence",expanded=False):
-        st.caption(e.get("grounding_rule","Historical patterns indicate what happened, not necessarily why."))
-        st.write(g.get("evidence_basis") or e.get("fact_based_observation") or "No evidence summary available.")
-    sources=r.get("knowledge_sources") or []
-    if sources:
-        with st.expander("📚 Knowledge sources",expanded=False):
-            for x in sources:
-                if isinstance(x,dict):
-                    st.markdown(f"**{x.get('source','Knowledge source')}** · {x.get('kind','')}")
-                    st.caption((x.get("content") or "")[:2500])
-
-
-def _humanize_key(value):
-    """Convert API field names into readable management labels."""
-    if value is None:
-        return ""
-
-    text = str(value).replace("_", " ").strip()
-
-    replacements = {
-        "ci": "CI",
-        "mttr": "MTTR",
-        "rto": "RTO",
-        "rpo": "RPO",
-        "rca": "RCA",
-        "sla": "SLA",
-        "ai": "AI",
-    }
-
-    words = text.split()
-    return " ".join(
-        replacements.get(word.lower(), word.capitalize())
-        for word in words
+def proactive_agent_api_url() -> str:
+    return getattr(
+        config,
+        "API_AGENT_PROACTIVE_URL",
+        "http://127.0.0.1:8000/api/agents/proactive",
     )
 
+def display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a display-only DataFrame with every cell normalized to plain text.
 
-def _format_evidence_value(value):
-    """Convert nested API evidence into readable text."""
+    This is intentionally separate from analytics data. Streamlit/PyArrow can fail
+    when an object column contains a mixture of strings, floats, timestamps, dicts,
+    lists or None. Converting every displayed cell to a Python string removes that
+    entire class of Arrow serialization errors without changing calculations.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df)
+    out = df.copy().reset_index(drop=True)
+
+    def safe_text(v):
+        if v is None:
+            return ""
+        if isinstance(v, (dict, list, tuple, set)):
+            try:
+                import json
+                return json.dumps(v, ensure_ascii=False, default=str)
+            except Exception:
+                return str(v)
+        if isinstance(v, pd.Timestamp):
+            return v.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(v, dt.datetime):
+            return v.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(v, dt.date):
+            return v.isoformat()
+        try:
+            if pd.isna(v):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(v)
+
+    out.columns = [str(c) for c in out.columns]
+    for col in out.columns:
+        out[col] = out[col].map(safe_text).astype(str)
+    return out
+
+
+def safe_markdown(value):
     if value is None:
-        return "-"
-
-    if isinstance(value, bool):
-        return "Yes" if value else "No"
-
-    if isinstance(value, dict):
-        parts = []
-
-        for key, val in value.items():
-            label = _humanize_key(key)
-
-            if isinstance(val, (dict, list)):
-                formatted = _format_evidence_value(val)
-            else:
-                formatted = _fmt(val)
-
-            parts.append(f"**{label}:** {formatted}")
-
-        return "<br>".join(parts)
-
-    if isinstance(value, list):
-        if not value:
-            return "-"
-
-        # List of dictionaries
-        if all(isinstance(x, dict) for x in value):
-            rows = []
-
-            for item in value:
-                parts = []
-
-                for key, val in item.items():
-                    label = _humanize_key(key)
-                    parts.append(f"{label}: {_fmt(val)}")
-
-                rows.append(" • ".join(parts))
-
-            return "<br>".join(
-                f"{idx}. {row}"
-                for idx, row in enumerate(rows, 1)
-            )
-
-        return "<br>".join(
-            f"{idx}. {_fmt(item)}"
-            for idx, item in enumerate(value, 1)
-        )
-
+        return ""
+    if isinstance(value, (dict, list)):
+        import json
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
     return str(value)
 
 
-def _management_evidence_rows(evidence):
-    """
-    Convert Agent 3 grounding evidence into management-readable rows.
-    Technical/raw evidence remains available separately.
-    """
-    if not isinstance(evidence, dict):
-        return []
-
-    rows = []
-
-    label_map = {
-        "incident_count": (
-            "Historical Incident Volume",
-            "Number of historical incidents associated with the CI."
-        ),
-        "historical_incident_count": (
-            "Historical Incident Volume",
-            "Number of historical incidents associated with the CI."
-        ),
-        "same_description_count_in_ci": (
-            "Recurring Incident Pattern",
-            "Number of incidents with the same description for this CI."
-        ),
-        "same_closure_count_in_ci": (
-            "Closure Pattern",
-            "Frequency of the current closure pattern."
-        ),
-        "same_route_count_in_ci": (
-            "Routing Pattern",
-            "Frequency of the current routing pattern."
-        ),
-        "fact_based_observation": (
-            "Fact-Based Observation",
-            "Direct observation derived from the incident history."
-        ),
-        "grounding_rule": (
-            "Grounding Rule",
-            "Rule used to prevent unsupported technical conclusions."
-        ),
-        "root_cause_support_level": (
-            "RCA Support Level",
-            "Strength of the available evidence for a technical cause."
-        ),
-        "technical_cause_proven": (
-            "Technical Cause Proven",
-            "Whether the available evidence proves a technical cause."
-        ),
-        "confidence": (
-            "AI Confidence",
-            "Confidence level assigned to the assessment."
-        ),
-        "evidence_basis": (
-            "Evidence Basis",
-            "Historical evidence used to support the assessment."
-        ),
-        "recurring_patterns": (
-            "Recurring Patterns",
-            "Patterns detected across the historical incidents."
-        ),
-        "top_patterns": (
-            "Top Historical Patterns",
-            "Most significant recurring patterns identified."
-        ),
-        "risk_level": (
-            "Risk Level",
-            "Overall operational risk indicated by the evidence."
-        ),
-        "risk": (
-            "Operational Risk",
-            "Risk identified from the available incident evidence."
-        ),
-    }
-
+def render_evidence(evidence: dict, title="Grounding evidence"):
+    """Render nested evidence as management-readable tables instead of raw JSON."""
+    if not isinstance(evidence, dict) or not evidence:
+        return
+    st.markdown(f"#### {title}")
+    rows=[]
     for key, value in evidence.items():
+        label=str(key).replace('_',' ').title()
+        if isinstance(value, list) and value and all(isinstance(x, dict) for x in value):
+            text='; '.join(', '.join(f"{k}: {v}" for k,v in x.items()) for x in value[:10])
+        elif isinstance(value, (dict,list)):
+            text=safe_markdown(value)
+        else:
+            text=safe_markdown(value)
+        rows.append({"Evidence item":label,"Observed evidence":text})
+    st.dataframe(display_df(pd.DataFrame(rows)), hide_index=True, width='stretch')
 
-        if key in {
-            "grounding_rule",
-            "fact_based_observation",
-            "evidence_basis",
-            "root_cause_support_level",
-            "technical_cause_proven",
-            "confidence",
-            "recurring_patterns",
-            "top_patterns",
-            "risk_level",
-            "risk",
-            "incident_count",
-            "historical_incident_count",
-            "same_description_count_in_ci",
-            "same_closure_count_in_ci",
-            "same_route_count_in_ci",
-        }:
 
-            title, meaning = label_map.get(
-                key,
-                (_humanize_key(key), "Evidence returned by the AI grounding process.")
+@st.cache_data(show_spinner='Loading incident files...')
+def get_data(signature: tuple) -> pd.DataFrame:
+    return analytics.load_all()
+sig = analytics.data_signature()
+df_all = get_data(sig)
+with st.sidebar:
+    st.subheader('Local data')
+    st.caption(f'CSV/Excel files: {len(analytics.list_data_files())}')
+    st.caption(f"Knowledge index: {config.DATA_DIR / 'chroma'}")
+    if st.button('Refresh data', width='stretch'):
+        st.cache_data.clear()
+        st.rerun()
+    st.divider()
+    st.subheader('Analytics Filters')
+    priorities_avail = [p for p in config.PRIORITY_ORDER if p in set(df_all['priority'])] if len(df_all) else []
+    ci_avail = ['All'] + sorted(df_all.loc[df_all['ci_name'] != 'Unknown', 'ci_name'].astype(str).unique().tolist()) if len(df_all) else ['All']
+    sources_avail = sorted(df_all['source_file'].unique()) if len(df_all) else []
+
+    def reset_filters():
+        st.session_state.update(f_start_on=False, f_end_on=False, f_prio=priorities_avail, f_ci='All', f_src=sources_avail)
+    if st.session_state.get('_sig') != sig:
+        st.session_state['_sig'] = sig
+        reset_filters()
+    d = df_all['opened_at'].dropna() if len(df_all) else pd.Series(dtype='datetime64[ns]')
+    dmin = d.min().date() if len(d) else dt.date.today()
+    dmax = d.max().date() if len(d) else dt.date.today()
+    start_on = st.checkbox('Enable Start Date', key='f_start_on')
+    start = st.date_input('Start Date', dmin, min_value=dmin, max_value=dmax) if start_on else None
+    end_on = st.checkbox('Enable End Date', key='f_end_on')
+    end = st.date_input('End Date', dmax, min_value=dmin, max_value=dmax) if end_on else None
+    prio = st.multiselect('Priority', priorities_avail, key='f_prio')
+    ci_filter = st.selectbox('CI name', ci_avail, key='f_ci')
+    src = st.multiselect('Source File', sources_avail, key='f_src')
+    st.button('Reset Filters', on_click=reset_filters, width='stretch')
+
+    def clear_chat():
+        st.session_state['messages'] = []
+    st.button('Clear Chat', on_click=clear_chat, width='stretch')
+df = analytics.apply_filters(df_all, start, end, prio, ci_filter, src)
+dash = dashboard.build_dashboard(df)
+fig = dash['figures']
+st.title('🤖 Incident Knowledge Copilot')
+if df_all.empty:
+    st.warning('No incident data found. Put CSV/Excel files in data/csv and run: python ingest.py')
+tab_chat, tab_dash, tab_server, tab_inc, tab_ai = st.tabs(['💬 Chat', '📊 Dashboard', '🖥️ Server Analysis', '🗂️ Incident Analysis', '🤖 AI Proactive & RCA'])
+with tab_chat:
+    st.session_state.setdefault('messages', [])
+    for m in st.session_state['messages']:
+        with st.chat_message(m['role']):
+            st.markdown(m['content'])
+            if m.get('actions'):
+                with st.expander('🛡️ Proactive actions', expanded=True):
+                    for a in m['actions']:
+                        st.markdown(f"**[{a['severity']}] {a['area']}** - {a['finding']}  \n➡️ {a['action']}")
+            if m.get('knowledge'):
+                with st.expander('📚 Knowledge sources'):
+                    for k in m['knowledge']:
+                        st.markdown(f"**{k['source']}** — {k['location']} (match {k['score']})")
+                        st.caption(k['text'])
+            if m.get('similar'):
+                with st.expander('Similar past incidents'):
+                    st.dataframe(display_df(pd.DataFrame(m['similar'])), hide_index=True, width='stretch')
+    if (q := st.chat_input('Ask about incidents, CI names, servers, or knowledge...')):
+        st.session_state['messages'].append({'role': 'user', 'content': q})
+        with st.chat_message('user'):
+            st.markdown(q)
+        with st.chat_message('assistant'):
+            with st.spinner('Searching local incident data...'):
+                try:
+                    res = chat_engine.answer(q, df)
+                    msg = {'role': 'assistant', 'content': res['answer'], 'actions': res.get('proactive_actions', []), 'similar': res.get('similar_incidents', []), 'knowledge': res.get('knowledge_sources', [])}
+                except Exception as exc:
+                    msg = {'role': 'assistant', 'content': f'Local search failed: `{type(exc).__name__}: {exc}`'}
+        st.session_state['messages'].append(msg)
+        st.rerun()
+with tab_dash:
+    k = dash['kpis']
+    c = st.columns(4)
+    c[0].metric('Total incidents', f"{k['total']:,}")
+    c[1].metric('Critical + High', f"{k['critical_high']:,}", f"{k['critical_high_pct']:.0f}% of total", delta_color='off')
+    c[2].metric('Average MTTR', k.get('mttr_display', '-'), f"{k.get('mttr_valid_incidents', 0):,} incidents with valid resolution time", delta_color='off')
+    c[3].metric('Top closure code', k['top_closure'])
+    st.caption(f"Period: {k['date_from']} -> {k['date_to']} | Files: {k['files']}")
+    a, b = st.columns(2)
+    a.altair_chart(fig['monthly_trend'], width='stretch')
+    b.altair_chart(fig['priority_trend'], width='stretch')
+    a, b = st.columns(2)
+    a.altair_chart(fig['mttr_trend'], width='stretch')
+    b.altair_chart(fig['mttr_priority'], width='stretch')
+    st.altair_chart(fig['top_route_cases'], width='stretch')
+    a, b = st.columns(2)
+    a.altair_chart(fig['top_closure_codes'], width='stretch')
+    b.altair_chart(fig['top_servers'], width='stretch')
+with tab_server:
+    st.subheader('Search by server / CI name')
+
+    ci_search = st.text_input(
+        'Search ci_name',
+        placeholder='e.g. APP-PAYMENTS-PROD or srv-web-prod-01',
+        key='server_ci_search',
+    )
+
+    server_view = pd.DataFrame()
+
+    if ci_search.strip():
+        try:
+            response = requests.get(
+                getattr(
+                    config,
+                    'API_SERVER_ANALYSIS_URL',
+                    'http://localhost:8000/api/server-analysis',
+                ),
+                params={
+                    'ci_name': ci_search.strip(),
+                },
+                timeout=config.API_TIMEOUT,
             )
 
-            rows.append({
-                "Evidence Area": title,
-                "Finding": _format_evidence_value(value),
-                "Management Relevance": meaning,
-            })
+            response.raise_for_status()
 
-    return rows
+            server_payload = response.json()
 
+            server_view = pd.DataFrame(
+                server_payload.get(
+                    'items',
+                    [],
+                )
+            )
 
-def render_proactive(p):
-    """
-    Management-friendly Agent 3 presentation.
-
-    The API remains the source of truth.
-    This function only transforms structured API evidence into
-    readable operational / management presentation.
-    """
-
-    g = p.get("grounded_assessment", {}) or {}
-
-    raw_evidence = (
-        g.get("evidence_basis")
-        or p.get("evidence")
-        or {}
-    )
-
-    ci_name = p.get("ci_name", "-")
-    incident_count = p.get("incident_count", 0)
-
-    st.markdown("## 🛡️ Proactive Risk Assessment")
-
-    # ------------------------------------------------------------------
-    # Executive KPI section
-    # ------------------------------------------------------------------
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "CI",
-        _fmt(ci_name)
-    )
-
-    c2.metric(
-        "Historical Incidents",
-        f"{incident_count:,}"
-        if isinstance(incident_count, (int, float))
-        else _fmt(incident_count)
-    )
-
-    c3.metric(
-        "AI Confidence",
-        _fmt(g.get("confidence"), "Low")
-    )
-
-    c4.metric(
-        "Technical Cause",
-        "Proven"
-        if g.get("technical_cause_proven")
-        else "Not Proven"
-    )
-
-    # ------------------------------------------------------------------
-    # Executive risk
-    # ------------------------------------------------------------------
-
-    st.markdown("### Executive Risk Assessment")
-
-    risk = (
-        g.get("key_risk")
-        or g.get("risk")
-        or "No single recurring technical risk has been proven."
-    )
-
-    if g.get("technical_cause_proven"):
-        st.success(risk)
-    else:
-        st.warning(risk)
-
-    # ------------------------------------------------------------------
-    # Management summary
-    # ------------------------------------------------------------------
-
-    st.markdown("### Management Summary")
-
-    support_level = (
-        g.get("root_cause_support_level")
-        or g.get("evidence_status")
-        or "Inconclusive"
-    )
-
-    management_summary = []
-
-    management_summary.append(
-        f"**CI:** {ci_name}"
-    )
-
-    management_summary.append(
-        f"**Historical incident volume:** "
-        f"{incident_count:,}"
-        if isinstance(incident_count, (int, float))
-        else f"**Historical incident volume:** {incident_count}"
-    )
-
-    management_summary.append(
-        f"**Evidence strength:** {_humanize_key(support_level)}"
-    )
-
-    if g.get("technical_cause_proven"):
-        management_summary.append(
-            "**Technical cause:** Supported by the available evidence."
-        )
-    else:
-        management_summary.append(
-            "**Technical cause:** Not conclusively established from the available evidence."
-        )
+        except Exception as exc:
+            st.error(
+                f'Server Analysis API unavailable: '
+                f'{type(exc).__name__}: {exc}'
+            )
 
     st.markdown(
-        "\n\n".join(management_summary)
+        f'**Recent incidents returned:** '
+        f'{len(server_view):,} '
+        f'(maximum 10)'
     )
 
-    # ------------------------------------------------------------------
-    # Grounding evidence - management view
-    # ------------------------------------------------------------------
+    if not ci_search.strip():
+        st.info(
+            'Enter a server / CI name to search.'
+        )
 
-    st.markdown("### 📊 Grounding Evidence")
+    elif server_view.empty:
+        st.info(
+            'No matching CI incidents. Verify that the CSV contains '
+            'a `ci_name` column and run `python ingest.py`.'
+        )
 
-    evidence_rows = _management_evidence_rows(raw_evidence)
+    else:
+        chart_df = df[
+            df['ci_name']
+            .astype(str)
+            .str.contains(
+                ci_search,
+                case=False,
+                na=False,
+            )
+        ]
 
-    if evidence_rows:
-
-        evidence_df = pd.DataFrame(evidence_rows)
+        st.altair_chart(
+            dashboard.top_servers(chart_df),
+            width='stretch',
+        )
 
         st.dataframe(
-            evidence_df,
-            width="stretch",
+            display_df(server_view),
             hide_index=True,
-            column_config={
-                "Evidence Area": st.column_config.TextColumn(
-                    "Evidence Area",
-                    width="medium"
-                ),
-                "Finding": st.column_config.TextColumn(
-                    "Finding",
-                    width="large"
-                ),
-                "Management Relevance": st.column_config.TextColumn(
-                    "Management Relevance",
-                    width="large"
-                ),
-            },
+            width='stretch',
         )
 
-    else:
-        st.info(
-            "No structured grounding evidence was returned by Agent 3."
+        st.divider()
+
+        st.subheader(
+            'Past 10 incidents for the searched CI'
         )
-
-    # ------------------------------------------------------------------
-    # Recurring patterns
-    # ------------------------------------------------------------------
-
-    patterns = []
-
-    if isinstance(raw_evidence, dict):
-
-        patterns = (
-            raw_evidence.get("recurring_patterns")
-            or raw_evidence.get("top_patterns")
-            or []
-        )
-
-    if patterns:
-
-        st.markdown("### 🔁 Recurring Incident Patterns")
-
-        pattern_df = _pattern_table(patterns)
-
-        if not pattern_df.empty:
-
-            st.dataframe(
-                pattern_df,
-                width="stretch",
-                hide_index=True
-            )
-
-        else:
-            st.info(
-                "No recurring incident pattern was identified."
-            )
-
-    # ------------------------------------------------------------------
-    # Preventive recommendations
-    # ------------------------------------------------------------------
-
-    st.markdown("### 🛠️ Preventive Recommendations")
-
-    recommendation = (
-        p.get("answer")
-        or p.get("recommendations")
-        or "No proactive recommendations were returned."
-    )
-
-    if isinstance(recommendation, list):
-
-        for idx, item in enumerate(recommendation, 1):
-            st.markdown(
-                f"**{idx}.** {_fmt(item)}"
-            )
-
-    elif isinstance(recommendation, dict):
-
-        for key, value in recommendation.items():
-
-            st.markdown(
-                f"**{_humanize_key(key)}**"
-            )
-
-            if isinstance(value, list):
-
-                for item in value:
-                    st.markdown(
-                        f"- {_fmt(item)}"
-                    )
-
-            else:
-                st.markdown(
-                    _fmt(value)
-                )
-
-    else:
-        st.markdown(str(recommendation))
-
-    # ------------------------------------------------------------------
-    # Recent incidents
-    # ------------------------------------------------------------------
-
-    recent = p.get("recent_incidents") or []
-
-    if recent:
-
-        st.markdown("### 🕒 Recent Incidents Considered")
-
-        rows = []
-
-        for x in recent:
-
-            if not isinstance(x, dict):
-                continue
-
-            rows.append({
-                "Incident": x.get("incident_id", "-"),
-                "Priority": x.get("priority", "-"),
-                "Description": x.get("description", "-"),
-                "Resolution": x.get("resolution", "-"),
-            })
-
-        if rows:
-
-            recent_df = pd.DataFrame(rows)
-
-            st.dataframe(
-                recent_df,
-                width="stretch",
-                hide_index=True
-            )
-
-        else:
-            st.info(
-                "No recent incident details were returned."
-            )
-
-    # ------------------------------------------------------------------
-    # Knowledge sources
-    # ------------------------------------------------------------------
-
-    sources = p.get("knowledge_sources") or []
-
-    if sources:
-
-        with st.expander(
-            "📚 Reference Knowledge Used",
-            expanded=False
-        ):
-
-            for x in sources:
-
-                if not isinstance(x, dict):
-                    continue
-
-                st.markdown(
-                    f"**{x.get('source', 'Knowledge source')}** "
-                    f"· {x.get('kind', '')}"
-                )
-
-                content = x.get("content") or ""
-
-                if content:
-                    st.caption(content[:2500])
-
-    # ------------------------------------------------------------------
-    # Raw evidence for technical users
-    # ------------------------------------------------------------------
-
-    with st.expander(
-        "🔧 Technical / Raw Grounding Evidence",
-        expanded=False
-    ):
 
         st.caption(
-            "This section contains the structured evidence returned by "
-            "Agent 3. It is retained for engineering review and auditability."
+            f'{len(server_view):,} recent incident(s) shown.'
         )
 
-        if raw_evidence:
-
-            st.json(raw_evidence)
-
-        else:
-
-            st.info(
-                "No raw grounding evidence was returned."
+        for _, row in server_view.iterrows():
+            incident_id = str(
+                row.get(
+                    'incident_id',
+                    'Unknown',
+                )
             )
 
-    # ------------------------------------------------------------------
-    # Governance / human approval
-    # ------------------------------------------------------------------
+            opened = row.get(
+                'opened_at',
+                '',
+            )
 
-    st.warning(
-        "⚠️ Human approval required. "
-        "No production action was executed."
-    )
+            opened_text = (
+                opened.strftime(
+                    '%Y-%m-%d %H:%M:%S'
+                )
+                if hasattr(
+                    opened,
+                    'strftime',
+                )
+                else str(opened)
+            )
 
+            label = (
+                f"{incident_id} | "
+                f"{row.get('ci_name', 'Unknown')} | "
+                f"{opened_text} | "
+                f"{row.get('description', '')}"
+            )
 
-for k,v in {"messages":[],"investigation":None,"rca":None,"proactive":None}.items(): st.session_state.setdefault(k,v)
+            with st.expander(label):
+                details = row.drop(
+                    labels=[
+                        'search_text',
+                    ],
+                    errors='ignore',
+                ).to_frame(
+                    'value'
+                )
 
-@st.cache_data(show_spinner="Loading incident data...")
-def load(sig): return analytics.load_all()
-df_all=load(analytics.data_signature())
+                st.dataframe(
+                    display_df(details),
+                    width='stretch',
+                )
 
-with st.sidebar:
- st.subheader("Local data"); st.caption(f"Incidents: {len(df_all):,}"); st.caption(f"Knowledge: {config.DATA_DIR/'chroma'}")
- if st.button("Refresh data",width="stretch"): st.cache_data.clear(); st.rerun()
- st.divider(); st.subheader("Filters")
- priorities=[p for p in getattr(config,"PRIORITY_ORDER",[]) if p in set(df_all.priority)] if len(df_all) else []
- cis=["All"]+sorted(df_all.loc[df_all.ci_name!="Unknown","ci_name"].astype(str).unique()) if len(df_all) else ["All"]
- sources=sorted(df_all.source_file.astype(str).unique()) if len(df_all) and "source_file" in df_all.columns else []
- start=st.date_input("Start date",df_all.opened_at.min().date() if len(df_all) else dt.date.today(),disabled=not st.checkbox("Enable start"))
- end=st.date_input("End date",df_all.opened_at.max().date() if len(df_all) else dt.date.today(),disabled=not st.checkbox("Enable end"))
- prio=st.multiselect("Priority",priorities,default=priorities); ci=st.selectbox("CI name",cis); src=st.multiselect("Source file",sources,default=sources)
- if st.button("Reset filters",width="stretch"): st.rerun()
- if st.button("Clear chat",width="stretch"): st.session_state.messages=[]; st.rerun()
+        st.subheader(
+            'AI-assisted proactive analysis'
+        )
 
-filtered=analytics.apply_filters(df_all,None if 'start' not in locals() else start,None if 'end' not in locals() else end,prio,ci,src)
-dash=dashboard.build_dashboard(filtered); fig=dash["figures"]
-st.title("🤖 Incident Knowledge Copilot")
+        st.caption(
+            'LLM is called only when you request proactive analysis. '
+            'All calculations above are deterministic Python/Pandas.'
+        )
 
-tab_chat,tab_dash,tab_server,tab_inc,tab_ai=st.tabs(["💬 Chat","📊 Dashboard","🖥️ Server Analysis","🗂️ Incident Analysis","🤖 AI Proactive & RCA"])
+        if st.button(
+            '🤖 Generate Proactive Measures',
+            key='generate_proactive',
+            width='stretch',
+        ):
+            requested_ci = ci_search.strip()
+            if not requested_ci:
+                st.warning('Enter a server / CI name before generating proactive measures.')
+            else:
+                with st.spinner('Generating proactive measures with the local AI engine...'):
+                    try:
+                        response = requests.post(
+                            proactive_agent_api_url(),
+                            json={"ci_name": ci_search.strip()},
+                            timeout=config.API_TIMEOUT,
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
 
-with tab_chat:
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]): st.markdown(m["content"])
-    q=st.chat_input("Ask about incidents, CI names, servers, or knowledge...")
-    if q:
-        st.session_state.messages.append({"role":"user","content":q})
-        try: msg=__import__("chat_engine").answer(q,filtered).get("answer","")
-        except Exception as e: msg=f"Local search failed: `{type(e).__name__}: {e}`"
-        st.session_state.messages.append({"role":"assistant","content":msg}); st.rerun()
+                        # IMPORTANT: persist the API response in session state.
+                        # Streamlit reruns the script after every widget interaction;
+                        # a local variable would otherwise disappear on the next run.
+                        st.session_state.proactive_result = payload
+                        st.session_state.proactive_ci = requested_ci
+                        try:
+                            fr = requests.get(forecast_api_url(), params={"ci_name": requested_ci}, timeout=30)
+                            fr.raise_for_status()
+                            st.session_state.forecast_result = fr.json()
+                            st.session_state.forecast_ci = requested_ci
+                        except Exception as forecast_exc:
+                            st.session_state.forecast_result = {"error": f"Forecast unavailable: {type(forecast_exc).__name__}: {forecast_exc}"}
+                            st.session_state.forecast_ci = requested_ci
+                    except requests.HTTPError as exc:
+                        body = ''
+                        try:
+                            body = response.text[:1000]
+                        except Exception:
+                            pass
+                        st.session_state.proactive_result = {
+                            'error': f'AI service returned HTTP {getattr(response, "status_code", "error")}: {body or exc}'
+                        }
+                        st.session_state.proactive_ci = requested_ci
+                    except Exception as exc:
+                        st.session_state.proactive_result = {
+                            'error': f'AI service unavailable: {type(exc).__name__}: {exc}'
+                        }
+                        st.session_state.proactive_ci = requested_ci
 
+        # Render persisted result OUTSIDE the button block so it survives reruns.
+        ai_plan = st.session_state.get('proactive_result')
+        saved_ci = st.session_state.get('proactive_ci', '')
+        current_ci = ci_search.strip()
 
-with tab_dash:
- k=dash["kpis"]; c=st.columns(4); c[0].metric("Total incidents",f"{k['total']:,}"); c[1].metric("Critical + High",f"{k['critical_high']:,}"); c[2].metric("Average MTTR",k.get("mttr_display","-")); c[3].metric("Top closure code",k.get("top_closure","-"))
- a,b=st.columns(2); a.altair_chart(fig["monthly_trend"],width="stretch"); b.altair_chart(fig["priority_trend"],width="stretch")
- a,b=st.columns(2); a.altair_chart(fig["mttr_trend"],width="stretch"); b.altair_chart(fig["mttr_priority"],width="stretch")
- st.altair_chart(fig["top_route_cases"],width="stretch"); a,b=st.columns(2); a.altair_chart(fig["top_closure_codes"],width="stretch"); b.altair_chart(fig["top_servers"],width="stretch")
+        if ai_plan and saved_ci.lower() == current_ci.lower():
+            if ai_plan.get('error'):
+                st.error(ai_plan['error'])
+            else:
+                st.markdown('### 🛡️ AI-Assisted Proactive Analysis')
 
-with tab_server:
- st.subheader("Server / CI Analysis"); s=st.text_input("Search ci_name",placeholder="srv-web-prod-01 or APP-PAYMENTS-PROD").strip()
- if s:
-  local=sort_recent(analytics.ci_incidents(filtered,s)); st.caption(f"Matching historical incidents: {len(local):,}. Showing 10 most recent.")
-  for _,r in local.head(10).iterrows(): expander(r,"srv")
-  if st.button("🤖 Generate Proactive Measures",width="stretch"):
-   try: st.session_state.proactive=post("/api/agents/proactive",{"ci_name":s},120)
-   except Exception as e: st.error(f"Agent 3 failed: {e}")
-  p=st.session_state.proactive
-  if p and p.get("ci_name")==s:
-   g=p.get("grounded_assessment",{}); st.markdown("### 🛡️ Grounded Proactive Risk"); st.info(g.get("key_risk","No specific recurring risk proven.")); st.json(g.get("evidence_basis",{})); st.markdown("### AI Recommendations"); st.markdown(p.get("answer","")); st.warning("Human approval required. No production action executed.")
- else: st.info("Enter a CI name to analyze.")
+                # Management summary
+                answer = str(ai_plan.get('answer') or '').strip()
+                if answer:
+                    st.markdown('#### Executive recommendation')
+                    st.markdown(answer)
+                else:
+                    st.info('The AI service completed successfully but did not return a recommendation.')
+
+                # Grounding / evidence in readable management format.
+                grounded = ai_plan.get('grounded_assessment') or {}
+                if grounded:
+                    st.markdown('#### Grounding evidence')
+                    risk = grounded.get('key_risk') or grounded.get('risk')
+                    confidence = grounded.get('confidence')
+                    basis = grounded.get('evidence_basis')
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.metric('Evidence confidence', str(confidence or 'Not stated'))
+                    with c2:
+                        if risk:
+                            st.metric('Primary recurring risk', str(risk)[:120])
+                        else:
+                            st.metric('Historical incidents', f"{ai_plan.get('incident_count', 0):,}")
+
+                    if risk:
+                        st.info(f'**Primary risk:** {risk}')
+
+                    if basis:
+                        if isinstance(basis, dict):
+                            rows = []
+                            for key, value in basis.items():
+                                if isinstance(value, (list, dict)):
+                                    if isinstance(value, list) and value and all(isinstance(x, dict) for x in value):
+                                        value_text = '; '.join(
+                                            ', '.join(f'{k}: {v}' for k, v in x.items())
+                                            for x in value[:10]
+                                        )
+                                    else:
+                                        value_text = str(value)
+                                else:
+                                    value_text = str(value)
+                                rows.append({'Evidence item': key.replace('_', ' ').title(), 'Observed evidence': value_text})
+                            if rows:
+                                st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+                        else:
+                            st.markdown(str(basis))
+
+                # API responses from different versions may expose evidence directly.
+                evidence = ai_plan.get('evidence') or {}
+                if evidence:
+                    with st.expander('Detailed evidence used by the agent', expanded=False):
+                        def _flatten_evidence(value, prefix=''):
+                            rows = []
+                            if isinstance(value, dict):
+                                for k, v in value.items():
+                                    label = f'{prefix} > {k}' if prefix else str(k)
+                                    rows.extend(_flatten_evidence(v, label))
+                            elif isinstance(value, list):
+                                if value and all(isinstance(x, dict) for x in value):
+                                    for idx, item in enumerate(value[:10], 1):
+                                        rows.extend(_flatten_evidence(item, f'{prefix} #{idx}'))
+                                else:
+                                    rows.append({'Evidence item': prefix, 'Observed evidence': str(value)})
+                            else:
+                                rows.append({'Evidence item': prefix, 'Observed evidence': str(value)})
+                            return rows
+                        ev_rows = _flatten_evidence(evidence)
+                        if ev_rows:
+                            st.dataframe(pd.DataFrame(ev_rows), hide_index=True, width='stretch')
+
+                # Knowledge sources are readable, not raw JSON.
+                knowledge = ai_plan.get('knowledge_sources') or []
+                if knowledge:
+                    with st.expander('📚 Knowledge sources used by AI', expanded=False):
+                        for idx, item in enumerate(knowledge, 1):
+                            if not isinstance(item, dict):
+                                st.markdown(f'**Source {idx}:** {item}')
+                                continue
+                            source = item.get('source', f'Knowledge source {idx}')
+                            kind = item.get('kind', '')
+                            st.markdown(f'**{source}**' + (f' — {kind}' if kind else ''))
+                            content = str(item.get('content') or '').strip()
+                            if content:
+                                st.caption(content)
+                            if idx < len(knowledge):
+                                st.divider()
+
+                timing = ai_plan.get('timing') or {}
+                if timing:
+                    ollama_seconds = timing.get('ollama_seconds')
+                    total_seconds = timing.get('total_seconds')
+                    timing_text = []
+                    if isinstance(ollama_seconds, (int, float)):
+                        timing_text.append(f'Ollama: {ollama_seconds:.1f}s')
+                    if isinstance(total_seconds, (int, float)):
+                        timing_text.append(f'Total: {total_seconds:.1f}s')
+                    if timing_text:
+                        st.caption(' | '.join(timing_text))
+
+                if ai_plan.get('requires_human_approval', True):
+                    st.warning('Human approval required. No production action was executed.')
+
+                    st.markdown('### ✅ Human Approval / Governance Decision')
+                    st.caption('Approval records the reviewer decision only. Incident Copilot does not execute production changes.')
+                    approval_decision = st.radio(
+                        'Decision',
+                        ['Approved', 'Rejected', 'Needs Review'],
+                        horizontal=True,
+                        key='server_approval_decision',
+                    )
+                    approval_action = st.text_area(
+                        'Action being approved',
+                        value=str(ai_plan.get('answer') or '').strip(),
+                        key='server_approval_action',
+                        height=100,
+                    )
+                    approval_reviewer = st.text_input('Reviewer', value='Human reviewer', key='server_approval_reviewer')
+                    approval_comments = st.text_area('Approval comments', key='server_approval_comments')
+                    if st.button('Submit Approval Decision', key='submit_server_approval', width='stretch'):
+                        try:
+                            ar = requests.post(
+                                approval_api_url(),
+                                json={
+                                    'ci_name': current_ci,
+                                    'incident_id': '',
+                                    'decision': approval_decision,
+                                    'approved_action': approval_action,
+                                    'reviewer': approval_reviewer,
+                                    'comments': approval_comments,
+                                },
+                                timeout=30,
+                            )
+                            ar.raise_for_status()
+                            st.session_state.approval_result = ar.json()
+                            st.success('Human approval decision submitted and recorded. No production change was executed.')
+                        except requests.HTTPError:
+                            st.error(f'Approval API returned HTTP {ar.status_code}: {ar.text[:1000]}')
+                        except Exception as approval_exc:
+                            st.error(f'Approval submission failed: {type(approval_exc).__name__}: {approval_exc}')
+
+                approval_saved = st.session_state.get('approval_result')
+                if approval_saved and isinstance(approval_saved, dict):
+                    saved = approval_saved.get('approval') or {}
+                    if saved.get('ci_name') == current_ci:
+                        st.success(f"Governance status: {saved.get('governance_status', saved.get('decision', 'Recorded'))}")
+
+                # Deterministic CI forecast and risk score.
+                forecast = st.session_state.get('forecast_result')
+                if forecast and st.session_state.get('forecast_ci', '').lower() == current_ci.lower():
+                    if forecast.get('error'):
+                        st.warning(forecast['error'])
+                    else:
+                        st.markdown('### 📈 CI Incident Forecast & Risk Score')
+                        fc1, fc2, fc3, fc4 = st.columns(4)
+                        fc1.metric('Risk score', f"{forecast.get('risk_score', 0)}/100")
+                        fc2.metric('Risk level', str(forecast.get('risk_level', 'Low')))
+                        fc3.metric('Avg monthly incidents', str(forecast.get('average_monthly_incidents', '-')))
+                        fc4.metric('90-day incidents', str(forecast.get('recent_90_day_incidents', '-')))
+                        history_rows = forecast.get('monthly_history') or []
+                        forecast_rows = forecast.get('forecast') or []
+                        if history_rows or forecast_rows:
+                            hist_df = pd.DataFrame(history_rows).rename(columns={'month':'Month','incident_count':'Actual incidents'})
+                            pred_df = pd.DataFrame(forecast_rows).rename(columns={'month':'Month','forecast_incidents':'Forecast incidents'})
+                            if not hist_df.empty:
+                                st.markdown('#### Historical incident trend')
+                                st.dataframe(display_df(hist_df), hide_index=True, width='stretch')
+                            if not pred_df.empty:
+                                st.markdown('#### Next 3-month forecast')
+                                st.dataframe(display_df(pred_df), hide_index=True, width='stretch')
+                        comps = forecast.get('risk_components') or {}
+                        if comps:
+                            st.caption('Risk score components: ' + ', '.join(f"{str(k).replace('_',' ').title()}={v}" for k,v in comps.items()))
+                        st.caption(forecast.get('forecast_method', 'Deterministic forecast based on incident history.'))
+
+                # Optional clear action for the current result.
+                if st.button('Clear proactive result', key='clear_server_proactive', width='stretch'):
+                    st.session_state.proactive_result = None
+                    st.session_state.proactive_ci = ''
+                    st.rerun()
 
 with tab_inc:
- st.subheader("Incident Analysis"); q=st.text_input("Incident number / description / CI",placeholder="101483").strip(); v=analytics.search_incidents(filtered,q); st.markdown(f"**Total incidents count:** {len(v):,}"); st.markdown("**CI name:** "+(", ".join(sorted(v.ci_name.dropna().astype(str).unique())) if len(v) else "-"))
- for _,r in v.head(100).iterrows(): expander(r,"inc")
+    st.subheader('Search incidents')
+    incident_search = st.text_input('Search incident', placeholder='Incident number, description, resolution, CI name...', key='incident_search')
+    incident_view = analytics.search_incidents(df, incident_search)
+    total = len(incident_view)
+    ci_names = sorted([x for x in incident_view['ci_name'].dropna().astype(str).unique() if x and x != 'Unknown'])
+    st.markdown(f'**Total incidents count:** {total}')
+    st.markdown(f"**CI name:** {(', '.join(ci_names) if ci_names else '-')}")
+    if total == 0:
+        st.info('No incidents found for the search.')
+    else:
+        for _, row in incident_view.head(100).iterrows():
+            incident_id = str(row.get('incident_id', 'Unknown'))
+            label = f"{incident_id} | {row.get('ci_name', 'Unknown')} | {row.get('description', '')}"
+            with st.expander(label):
+                details = row.drop(labels=['search_text'], errors='ignore').to_frame('value')
+                st.dataframe(display_df(details), width='stretch')
+
 
 with tab_ai:
-    st.subheader("🤖 Human Feedback → Incident Record → RCA Summary")
-    iid=st.text_input("Incident number",placeholder="101483").strip()
-    c1,c2,c3=st.columns(3)
-    with c1: run2=st.button("2️⃣ Generate Grounded RCA",width="stretch")
-    with c2: run3=st.button("3️⃣ Proactive Remediation",width="stretch")
-    with c3:
-        if st.button("Clear AI results",width="stretch"):
-            st.session_state.rca=None; st.session_state.proactive=None; st.rerun()
-    if run2 and iid:
-        try:
-            with st.spinner("Agent 2 is generating a grounded RCA..."): st.session_state.rca=post("/api/agents/root-cause",{"incident_id":iid},120)
-        except Exception as e: st.error(f"Agent 2 failed: {type(e).__name__}: {e}")
-    r=st.session_state.rca
-    if r:
-        render_rca(r)
-        st.divider(); st.markdown("### 4️⃣ Human Feedback")
-        st.caption("Validate or correct the AI assessment before it becomes part of the incident record.")
-        decision=st.radio("RCA assessment",["Approved","Modified","Rejected"],horizontal=True,key="decision")
-        root=st.text_area("Validated / corrected root cause",key="human_root")
-        corr=st.text_area("Validated corrective action",key="human_corr")
-        prev=st.text_area("Validated preventive action",key="human_prev")
-        comments=st.text_area("Reviewer comments",key="human_comments")
-        if st.button("💾 Submit Human Feedback",width="stretch"):
-            try:
-                inc=r.get("incident",{}); saved=post("/api/agents/feedback",{"incident_id":inc.get("incident_id",iid),"decision":decision,"corrected_root_cause":root,"corrective_action":corr,"preventive_action":prev,"comments":comments},30)
-                st.success("Human feedback saved to the incident record.")
-                with st.expander("Saved feedback response",expanded=False): st.json(saved)
-            except Exception as e: st.error(f"Feedback save failed: {type(e).__name__}: {e}")
-    # Agent 3 CI input must be rendered BEFORE the button action.
-    # Previously the input was created inside `if run3`, so the first click
-    # only created the widget and no request was sent.
-    incident_ci = (r.get("incident", {}).get("ci_name", "") if r else "").strip()
-    ci3 = st.text_input(
-        "CI for Proactive Remediation",
-        value=incident_ci,
-        key="ci3",
-        placeholder="srv-web-prod-01 or APP-PAYMENTS-PROD",
-        help="Enter the CI name. If Agent 2 RCA has already run, its CI is pre-filled."
-    ).strip()
+    st.subheader('🤖 AI Proactive Analysis & RCA')
+    st.caption('Management view of grounded RCA and proactive remediation. AI recommendations are advisory only; no production action is executed.')
 
-    if run3:
-        if not ci3:
-            st.warning("Enter a CI name before running Agent 3 Proactive Remediation.")
+    incident_id = st.text_input('Incident number for RCA', placeholder='e.g. 101483', key='agent_incident_id').strip()
+    ci_for_proactive = st.text_input('CI name for proactive remediation', placeholder='e.g. srv-web-prod-01', key='agent_proactive_ci_tab').strip()
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        run_rca = st.button('🔎 Generate Grounded RCA', key='ai_generate_rca', width='stretch')
+    with b2:
+        run_proactive = st.button('🛡️ Generate Proactive Recommendations', key='ai_generate_proactive', width='stretch')
+    with b3:
+        if st.button('Clear AI Results', key='ai_clear_results', width='stretch'):
+            st.session_state['agent_rca_result'] = None
+            st.session_state['agent_proactive_result'] = None
+            st.rerun()
+
+    if run_rca:
+        if not incident_id:
+            st.warning('Enter an incident number first.')
         else:
-            try:
-                with st.spinner("Agent 3 is generating grounded proactive recommendations..."):
-                    st.session_state.proactive = post(
-                        "/api/agents/proactive",
-                        {"ci_name": ci3},
-                        120
+            with st.spinner('Agent 2 is generating the grounded RCA...'):
+                try:
+                    r=requests.post(getattr(config,'API_AGENT_ROOT_CAUSE_URL','http://127.0.0.1:8000/api/agents/root-cause'), json={'incident_id':incident_id}, timeout=getattr(config,'API_TIMEOUT',120))
+                    r.raise_for_status()
+                    st.session_state['agent_rca_result']=r.json()
+                except requests.HTTPError:
+                    st.session_state['agent_rca_result']={'error':f'RCA API returned HTTP {r.status_code}: {r.text[:1000]}'}
+                except Exception as exc:
+                    st.session_state['agent_rca_result']={'error':f'RCA service unavailable: {type(exc).__name__}: {exc}'}
+
+    if run_proactive:
+        if not ci_for_proactive:
+            st.warning('Enter a CI name first.')
+        else:
+            with st.spinner('Agent 3 is generating grounded proactive recommendations...'):
+                try:
+                    r=requests.post(getattr(config,'API_AGENT_PROACTIVE_URL','http://127.0.0.1:8000/api/agents/proactive'), json={'ci_name':ci_for_proactive}, timeout=getattr(config,'API_TIMEOUT',120))
+                    r.raise_for_status()
+                    st.session_state['agent_proactive_result']=r.json()
+                    try:
+                        fr=requests.get(forecast_api_url(), params={'ci_name':ci_for_proactive}, timeout=30)
+                        fr.raise_for_status()
+                        st.session_state['forecast_result']=fr.json()
+                        st.session_state['forecast_ci']=ci_for_proactive
+                    except Exception as forecast_exc:
+                        st.session_state['forecast_result']={'error':f'Forecast unavailable: {type(forecast_exc).__name__}: {forecast_exc}'}
+                        st.session_state['forecast_ci']=ci_for_proactive
+                except requests.HTTPError:
+                    st.session_state['agent_proactive_result']={'error':f'Proactive API returned HTTP {r.status_code}: {r.text[:1000]}'}
+                except Exception as exc:
+                    st.session_state['agent_proactive_result']={'error':f'Proactive service unavailable: {type(exc).__name__}: {exc}'}
+
+    rca=st.session_state.get('agent_rca_result')
+    if rca:
+        st.divider()
+        st.markdown('### 🔎 Executive RCA')
+        if rca.get('error'):
+            st.error(rca['error'])
+        else:
+            inc=rca.get('incident') or {}
+            if inc:
+                c=st.columns(4)
+                c[0].metric('Incident',str(inc.get('incident_id','-')))
+                c[1].metric('CI',str(inc.get('ci_name','-')))
+                c[2].metric('Priority',str(inc.get('priority','-')))
+                c[3].metric('Closure',str(inc.get('closure_code','-')))
+            ga=rca.get('grounded_assessment') or {}
+            c=st.columns(3)
+            c[0].metric('RCA confidence',str(ga.get('confidence','Low')))
+            c[1].metric('Technical cause proven','Yes' if ga.get('technical_cause_proven') else 'No')
+            c[2].metric('CI incident history',f"{rca.get('historical_incident_count',0):,}")
+            st.markdown('#### Executive summary')
+            st.markdown(rca.get('answer') or 'Root cause remains unconfirmed; additional technical validation is required.')
+            if ga.get('evidence_basis'):
+                st.info(str(ga.get('evidence_basis')))
+            ev=rca.get('evidence') or {}
+            if ev:
+                render_evidence(ev)
+            similar=rca.get('similar_incidents') or []
+            if similar:
+                with st.expander('Historical incidents used as supporting evidence', expanded=False):
+                    st.dataframe(display_df(pd.DataFrame(similar)), hide_index=True, width='stretch')
+            knowledge=rca.get('knowledge_sources') or []
+            if knowledge:
+                with st.expander('Knowledge references used by the agent', expanded=False):
+                    for i,k in enumerate(knowledge,1):
+                        if isinstance(k,dict):
+                            st.markdown(f"**{k.get('source','Knowledge source')}**")
+                            st.caption(str(k.get('content','')))
+                        else:
+                            st.markdown(str(k))
+
+    pro=st.session_state.get('agent_proactive_result')
+    if pro:
+        st.divider()
+        st.markdown('### 🛡️ Executive Proactive Recommendation')
+        if pro.get('error'):
+            st.error(pro['error'])
+        else:
+            c=st.columns(3)
+            c[0].metric('CI',str(pro.get('ci_name','-')))
+            c[1].metric('Incident history',f"{pro.get('incident_count',0):,}")
+            c[2].metric('AI status',str(pro.get('ai_status','Unknown')).title())
+            st.markdown('#### Management recommendation')
+            st.markdown(pro.get('answer') or 'No recommendation was returned.')
+            ga=pro.get('grounded_assessment') or {}
+            if ga:
+                risk=ga.get('key_risk')
+                if risk: st.info(f"**Primary operational risk:** {risk}")
+                basis=ga.get('evidence_basis')
+                if isinstance(basis,dict): render_evidence(basis)
+            recent_items=pro.get('recent_incidents') or []
+            if recent_items:
+                with st.expander('Recent incidents considered by the agent', expanded=False):
+                    st.dataframe(display_df(pd.DataFrame(recent_items)), hide_index=True, width='stretch')
+            knowledge=pro.get('knowledge_sources') or []
+            if knowledge:
+                with st.expander('Knowledge references used by the agent', expanded=False):
+                    for k in knowledge:
+                        if isinstance(k,dict):
+                            st.markdown(f"**{k.get('source','Knowledge source')}**")
+                            st.caption(str(k.get('content','')))
+            st.warning('Human approval required. No production action was executed.')
+
+            st.markdown('### ✅ Human Approval / Governance Decision')
+            st.caption('Record the reviewer decision before any operational implementation. This application does not execute production changes.')
+            ai_decision = st.radio('Decision', ['Approved', 'Rejected', 'Needs Review'], horizontal=True, key='ai_approval_decision')
+            ai_action = st.text_area('Action being approved', value=str(pro.get('answer') or ''), key='ai_approval_action', height=100)
+            ai_reviewer = st.text_input('Reviewer', value='Human reviewer', key='ai_approval_reviewer')
+            ai_comments = st.text_area('Approval comments', key='ai_approval_comments')
+            if st.button('Submit Approval Decision', key='ai_submit_approval', width='stretch'):
+                try:
+                    ar = requests.post(
+                        approval_api_url(),
+                        json={
+                            'ci_name': str(pro.get('ci_name', ci_for_proactive)),
+                            'incident_id': str(incident_id),
+                            'decision': ai_decision,
+                            'approved_action': ai_action,
+                            'reviewer': ai_reviewer,
+                            'comments': ai_comments,
+                        },
+                        timeout=30,
                     )
-            except Exception as e:
-                st.error(f"Agent 3 failed: {type(e).__name__}: {e}")
-
-    p = st.session_state.proactive
-    if p:
-        st.divider(); render_proactive(p)
-
+                    ar.raise_for_status()
+                    saved = ar.json()
+                    st.session_state.approval_result = saved
+                    status = (saved.get('approval') or {}).get('governance_status', 'Recorded')
+                    st.success(f'Approval decision recorded: {status}. No production change was executed.')
+                except requests.HTTPError:
+                    st.error(f'Approval API returned HTTP {ar.status_code}: {ar.text[:1000]}')
+                except Exception as exc:
+                    st.error(f'Approval submission failed: {type(exc).__name__}: {exc}')
