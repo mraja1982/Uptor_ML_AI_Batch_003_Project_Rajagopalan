@@ -1,10 +1,41 @@
-streamlit>=1.45
-pandas>=2.2
-openpyxl>=3.1
-altair>=5.4
-chromadb>=1.0
-pypdf>=5.0
-fastapi>=0.115
-uvicorn[standard]>=0.34
-requests>=2.32
-pydantic>=2.10
+# ============================================================
+# Incident Copilot - Python Dependencies
+# ============================================================
+
+# Web/API backend
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+
+# Streamlit UI
+streamlit>=1.40,<2.0
+
+# Data processing
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+
+# HTTP/API communication
+requests>=2.32,<3.0
+
+# Visualization
+plotly>=5.24,<7.0
+altair>=5.4,<7.0
+
+# Excel / spreadsheet ingestion
+openpyxl>=3.1,<4.0
+xlrd>=2.0,<3.0
+
+# PDF knowledge ingestion
+pypdf>=5.0,<7.0
+
+# Local vector database / RAG knowledge index
+chromadb>=0.5,<2.0
+
+# Embeddings
+sentence-transformers>=3.0,<6.0
+
+# ML / numerical dependencies used by sentence-transformers
+scikit-learn>=1.5,<2.0
+scipy>=1.13,<2.0
+
+# PyTorch backend for sentence-transformers
+torch>=2.4,<3.0
